@@ -1,0 +1,11 @@
+# Merge these sections into the active profile's config.yaml; preserve other entries.
+plugins:
+  enabled:
+    - apple-passwords
+secrets:
+  apple_passwords:
+    enabled: true
+    override_existing: false
+    timeout_seconds: 45
+    env:
+      EXAMPLE_API_KEY: applepw://example.com/alice/password
