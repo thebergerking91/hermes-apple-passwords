@@ -6,24 +6,39 @@ These instructions apply to the entire repository. Read `README.md`,
 ## Purpose and scope
 
 This is a native Hermes Agent plugin for credentials stored in Apple Passwords
-on macOS. It provides a CLI, a discoverable skill, and a mapped SecretSource.
-Preserve the familiar 1Password-style read, run, inject, and startup-mapping
-workflows while documenting differences accurately.
+on macOS. It mirrors Hermes's built-in 1Password integration: a mapped
+SecretSource (`secrets.apple_passwords`), an operator CLI (`setup/status/set/remove/
+sync/disable` plus `pair/list/read/run/inject/vault`), an opt-in `browser_vault`
+login backend (`vault.apple_passwords`), and a discoverable skill. Document every
+difference from 1Password accurately.
 
 The backend uses the unofficial `apwlib` browser bridge. Do not replace it with
 generic login Keychain access, a CSV export, or a separate vault and claim
-equivalent Apple Passwords support. Passkeys, service accounts, bulk export,
-credential mutation, and native Hermes browser-vault integration are currently
-out of scope. Do not claim those capabilities without implementation and validation.
+equivalent Apple Passwords support. Passkeys, service accounts, bulk export, and
+credential mutation are out of scope. Do not claim those capabilities without
+implementation and validation.
 
 ## Repository map
 
-- `__init__.py`: Hermes registration; keep imports lazy where required by loading.
-- `plugin.yaml`: plugin metadata and dependency declarations.
-- `backend.py`: Apple Passwords bridge worker and credential selection.
-- `source.py`: reference parsing, worker invocation, configuration, and SecretSource.
-- `cli.py`: status, pair, list, read, run, and inject commands.
+- `__init__.py`: Hermes registration; keep imports lazy. Installs the vault wrapper
+  only in-process (never inside a plugin host process).
+- `plugin.yaml`: plugin metadata and pinned dependency declarations.
+- `backend.py`: standalone worker (stdlib + lazy apwlib only) run as
+  `python -P backend.py OP [-- VALUES]`; one JSON line on stdout. The protocol and
+  error kinds are the contract between it and `bridge.py`; change both together.
+- `bridge.py`: Hermes-side launcher. Passes the dependency directories explicitly,
+  because Hermes's `run_secret_cli` strips `PYTHONPATH`; pairing runs with
+  `PYTHONSAFEPATH=1` and a safe cwd because it can start the long-lived daemon.
+- `source.py`: SecretSource with 1Password-parity semantics (override default true,
+  per-ref warnings, in-memory cache only) and helpers used by the CLI.
+- `cli.py`: `hermes apple-passwords …`. Never use argparse dests `command` or `func`:
+  Hermes's `main()` reads `args.command` before dispatch.
+- `vault.py`: `LoginBackend` for `browser_vault`. Hermes has no public hook, so it
+  wraps `agent.vault_backends.enabled_backends` (package and `base` attributes).
+  Keep it defensive: any mismatch must disable only this backend. Origins come from
+  one Apple entry only; colliding handles are dropped, never merged.
 - `install.py`: source installer; preserve profile selection and overwrite refusal.
+  New runtime modules must be added to its copy list.
 - `skills/apple-passwords/SKILL.md`: instructions exposed to Hermes users/agents.
 - `tests/`: synthetic unit tests and real Hermes loader/orchestrator integration.
 - `config.example.yaml`: reference-only configuration example.
@@ -48,9 +63,10 @@ out of scope. Do not claim those capabilities without implementation and validat
   and symlinks, and validate references. Substitution is literal, not format-aware.
 - Do not add plaintext credential caches, telemetry containing secrets, clipboard
   transfer, or automatic vault enumeration.
-- Preserve all-or-none source fetches and default environment/.env precedence.
-  Return values through Hermes's secret orchestrator rather than changing
-  `os.environ` directly.
+- Preserve 1Password-parity source semantics: `override_existing` defaults to true,
+  an unresolved mapping is a warning while the others load, and one-time-code refs
+  are refused as startup mappings. Return values through Hermes's secret orchestrator
+  rather than changing `os.environ` directly.
 - Do not describe environment injection, profile mappings, or a shared same-user
   daemon as a security sandbox or multi-tenant isolation boundary.
 
@@ -84,6 +100,11 @@ If pytest is installed, the same suite can also be run with:
 ```sh
 PYTHONPATH=/absolute/path/to/hermes-agent python -m pytest tests -q
 ```
+
+Run single files with `discover -s tests -p test_X.py`, not `tests/test_X.py`: a Hermes
+checkout on `PYTHONPATH` has its own `tests` package that shadows this one. Hermes's
+managed runtime supplies dependencies through `PYTHONPATH`, so include its
+site-packages directory as well when using that interpreter.
 
 Use a separate development environment; do not modify a user's Hermes-managed
 environment with raw pip. Use temporary Hermes homes for installation and integration

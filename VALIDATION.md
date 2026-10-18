@@ -1,52 +1,73 @@
 # Validation
 
-This release is a tested implementation, pending real macOS acceptance testing.
+v0.2.0 is a tested implementation, **pending real macOS acceptance testing with a paired
+bridge**. Nothing below has read a live password vault.
 
-## Automated checks
+## Automated checks (2026-10-18)
 
-Build result: **24 tests passed**, with no skips, on Python 3.12.14/Linux.
-Both unittest discovery and pytest ran successfully. Real macOS acceptance checks
-below remain unexecuted.
+**311 tests passed, 0 skipped** with `python -m unittest discover -s tests` on macOS 27.0.1
+(arm64), Python 3.14.7 (Hermes's bundled runtime), against Hermes
+`d923a5eb487a17c0a68801bba9ef0f56c81040a8`. pytest was not installed in that environment
+and was not run.
 
-The suite uses synthetic credentials and covers URI validation, exact saved-host and
-account matching, duplicate rejection, OTP selection, metadata filtering, sanitized
-errors, explicit reveal gating, child environment isolation, suppressed output, exit
-codes, template substitution, private exclusive output, all-or-none startup fetches,
-configuration validation, timeout bounds, whitespace/NUL handling, and the real worker
-JSON protocol for non-secret status and invalid references on Linux.
+Coverage, all with synthetic values:
 
-An integration test installs into a temporary Hermes profile, loads the plugin through
-the actual Hermes loader, verifies skill/command/source registration, and exercises the
-real secret orchestrator's precedence behavior with a synthetic subprocess response.
-It does not access a live password vault.
+- Worker (`backend.py`): reference parsing, exact saved-host + username matching, username
+  narrowing, duplicate → ambiguous, missing → not_found, one row per entry for the vault,
+  sibling hosts in `list`, OTP matching, apwlib exception mapping (incl. bare `SessionError`
+  with/without a cause), per-ref vs global failures, stdout protected from library prints,
+  single-JSON-line protocol in a real subprocess.
+- Launcher (`bridge.py`): the real `run_secret_cli` with `PYTHONPATH` removed still lets the
+  worker import a dependency (regression for the v0.1 "apwlib unreachable" bug), `-P`,
+  `PYTHONSAFEPATH`, safe cwd for pairing, fixed error text, timeouts, malformed output.
+- Secret source: 1Password-parity precedence, per-ref warnings, remediation hints,
+  in-memory cache/TTL, OTP refs refused for startup, never writes `os.environ`.
+- CLI: every subcommand, a Hermes-shaped parser (regression for the v0.1 `run` crash),
+  config writes through patched loaders, `run` env denylist, `inject` file safety.
+- Vault backend: against the real `agent.vault_backends` and `browser_vault_list`,
+  per-entry origins, colliding handles dropped, scope checks, install/uninstall.
+- Integration (`tests/test_hermes_integration.py`): install into a temp profile, load through
+  Hermes's real `PluginManager`, real `hermes_cli.main` dispatch of `status`/`run` with exit
+  codes, real secret orchestrator `apply_all`, real worker importing a synthetic `apwlib`
+  through the stripped environment, and real `browser_vault_list` + `backend_for_handle`.
 
-Reproduce with Python 3.12+, a Hermes checkout on PYTHONPATH and its import dependencies:
+Reproduce from the repository root (the Hermes checkout and its import dependencies on
+`PYTHONPATH`; use `discover`, because a Hermes checkout has its own `tests` package):
 
-    PYTHONPATH=/absolute/path/to/hermes-agent python -m unittest discover -s tests -v
+    PYTHONPATH=/absolute/path/to/hermes-agent:/path/to/hermes/site-packages \
+      python -m unittest discover -s tests -v
 
-Reference commits: Hermes e6f57427c198cfd96854522b7a9159eb007e13c2;
-apwlib fecfda7005dd49f1856526a80235d38a11a24c15 (package version 0.1.2).
+## Manual smoke test with the real apwlib (no bridge running)
 
-## Required real-Mac checks (not executed here)
+With `apwlib==0.1.2` + `chauffeur==0.14.1` on the import path and a temporary profile,
+through Hermes's `main()`: `status` reported `apwlib: installed / Bridge: stopped / not
+paired`; `setup`, `set`, `vault add/enable` wrote the expected config; `set` refused an `/otp`
+ref; `read`, `list` and startup failed cleanly with the fixed "bridge is not running; run
+`hermes apple-passwords pair`" message; the real `browser_vault_list` reported the Apple
+Passwords backend with the same message; `~/.apwlib` was never created (nothing started a
+daemon). Without apwlib, `status` reported `apwlib: missing` and suggested `hermes pm repair`.
 
-Use a disposable synthetic login in Apple Passwords, not production credentials:
+## Required real-Mac checks (not yet executed)
 
-1. Install and enable in a temporary Hermes profile using Python 3.12+.
-2. Check status, pair in a local terminal, and complete Apple's PIN prompt. Verify
-   the supported browser/extension starts and status reports paired.
-3. List the exact saved domain and confirm only account metadata appears. Verify an
-   explicit read returns the exact synthetic password.
-4. Use run with a local consumer that checks its injected variable and exits without
-   printing it. Confirm the exit code reaches the shell.
-5. Inject into a disposable new file, check its value locally and mode 0600, verify
-   overwrite is refused, then delete the file.
-6. Configure a startup mapping; verify .env wins unless override_existing is enabled.
-7. Restart/stop the bridge; verify startup fails cleanly without a PIN prompt. Re-pair
-   locally and verify recovery; also test pairing cancellation.
-8. Verify sibling-domain and duplicate accounts are not silently selected. Test an
-   OTP immediately before use if the synthetic entry has one.
-9. Start a new Hermes conversation and verify the skill is discoverable. Keep test
-   values synthetic because explicit reads/visible output may enter transcripts.
+Use a disposable synthetic login in Apple Passwords, never production credentials:
 
-Record macOS and browser versions before calling a release production-ready. Passkeys,
-service-account authorization and native browser-vault integration are not implemented.
+1. `hermes plugins install …` (or `install.py` + `hermes plugins enable`) in a temporary
+   profile; confirm `status` shows `apwlib: installed`.
+2. `hermes apple-passwords pair` in a local terminal; enter Apple's PIN; `status` shows paired.
+   Also test cancelling and a wrong PIN.
+3. `list DOMAIN`: only metadata; exact saved hosts shown; `read … --reveal` returns the
+   synthetic password; record the format Apple uses for saved sites.
+4. `run` with a consumer that checks its variable without printing it; exit code propagates.
+5. `inject` into a new file; mode 0600; overwrite refused; delete it.
+6. `set` + new session: the value is loaded; `.env` loses unless `override_existing: false`.
+7. Stop the bridge / reboot: startup reports "not running" without a PIN prompt; re-pair recovers.
+8. Sibling-host and duplicate accounts are not silently selected.
+9. OTP: `read …/otp --reveal` immediately; record `OTPEntry.domain`'s format (the parent-domain
+   match is unverified).
+10. Browser vault: `vault add`/`enable`, new session, have the agent sign in to the synthetic
+    site via `browser_vault`; confirm fill refuses a different origin and the transcript never
+    contains the password.
+11. New session: the `apple-passwords:apple-passwords` skill is discoverable.
+
+Record macOS, browser, Python, Hermes and apwlib versions before calling a release
+production-ready.

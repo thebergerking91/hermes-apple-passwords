@@ -1,7 +1,7 @@
 ---
 name: apple-passwords
-description: Use passwords and verification codes saved in Apple Passwords on macOS. Pair locally, find accounts by domain, read explicit references, inject templates, and run commands with credentials without printing them.
-version: 0.1.0
+description: Use passwords and verification codes saved in Apple Passwords on macOS, the way the 1Password integration works — startup secret mappings, browser sign-in via browser_vault, and op-style read/run/inject without printing secrets.
+version: 0.2.0
 platforms: [macos]
 metadata:
   hermes:
@@ -11,72 +11,70 @@ metadata:
 
 # Apple Passwords
 
-Use the installed native Hermes plugin through the terminal tool on the user's Mac.
-This accesses live Apple Passwords through apwlib, an unofficial browser-extension
-bridge. It does not use a separate credential vault or export CSVs.
+The `apple-passwords` plugin connects Hermes to the user's live Apple Passwords through
+apwlib, an unofficial browser-extension bridge on their Mac. Drive it with the terminal
+tool (`hermes apple-passwords …`) and, for website logins, the `browser_vault` tool.
 
-## Setup and pairing
+## First check
 
-Run `hermes apple-passwords status`. If unavailable or unpaired, ask the user to run
-`hermes apple-passwords pair` in a local interactive terminal. The user must enter
-the PIN shown by macOS locally. Never request the PIN or Mac login password in chat,
-script the authentication dialog, or attempt to bypass authentication. Pairing can
-be required again after the bridge/browser restarts. The bridge uses a supported
-Chromium browser and a downloaded copy of Apple's extension; it is not an Apple API.
+    hermes apple-passwords status
 
-## Find an account
+- `apwlib: missing` → tell the user to run `hermes pm repair` and restart Hermes.
+- `Bridge: stopped` or `Pairing: not paired` → ask the user to run
+  `hermes apple-passwords pair` **in their own local terminal** and type the PIN macOS
+  shows. Never ask for the PIN or their Mac password in chat, never script the dialog,
+  never try to bypass authentication.
+
+## Logging in to a website (preferred for browser tasks)
+
+Use `browser_vault`, never a raw password in browser tool arguments:
+`action=list` → pick the `applepw:` handle for the site → navigate to the login page →
+`action=fill`. Type the shown identifier yourself if the form needs it. Apple Passwords
+items appear only for domains the user allowed; if the site is missing, tell the user to
+run `hermes apple-passwords vault add DOMAIN` and `hermes apple-passwords vault enable`
+and start a new session. Do not change vault settings yourself unless asked.
+
+## Finding the right reference
 
     hermes apple-passwords list github.com
 
-This displays only matching account metadata. Search requires a domain; no global
-vault enumeration or arbitrary title search is supported. Use the exact saved
-domain and username. Never choose the first result when accounts are ambiguous.
+Shows saved hosts and usernames only. Use the exact host from the first column and the
+percent-encoded username: `applepw://HOST/USERNAME/FIELD` with FIELD `password`,
+`username` or `otp` (e.g. `applepw://github.com/me%40example.com/password`). Never pick
+the first of several accounts — ask the user which one.
 
-## References
-
-Use `applepw://DOMAIN/URL-ENCODED-USERNAME/FIELD`, with field `password`, `username`,
-or `otp`. Example: `applepw://github.com/person%40example.com/password`.
-Percent-encode slashes, spaces, @ and other special characters in the username.
-References identify credentials but contain no password values.
-
-## Prefer command injection
+## Using a credential without seeing it
 
     hermes apple-passwords run --env SERVICE_PASSWORD=applepw://example.com/alice/password -- /absolute/path/to/trusted-command
 
-The child receives only a small base environment and explicit mappings. Output is
-suppressed by default. Do not add `--show-output` unless the user authorizes the
-output and the command will not disclose credentials. The child can still use or
-send its credential; verify its purpose and destination before running it. Do not
-use echo, printenv, tracing, or a command that prints the environment.
+Output is suppressed by default; do not add `--show-output` unless the user asks and the
+command cannot print the credential. Never use echo, printenv, `sh -c`, tracing, or
+anything that prints or forwards the environment. Check what the command does with the
+credential before running it.
 
-## Template injection
-
-Place a reference in a template: `password={{ applepw://example.com/alice/password }}`.
+Templates: `{{ applepw://example.com/alice/password }}` placeholders, then
 
     hermes apple-passwords inject --input config.template --output private-config.txt
 
-The output must be a new file and is created with owner-only permissions. It contains
-plaintext secrets: do not read it into model context, commit it, or include it in
-attachments. Remove it when no longer needed.
+The output contains plaintext: never read it into context, commit it, or attach it.
+Delete it when done.
 
-## Explicit reveal only
+## Revealing a value
 
     hermes apple-passwords read applepw://example.com/alice/password --reveal
 
-Use only when the user explicitly asks to display that value. The output can enter
-chat history and the model provider's context. Treat verification codes as secrets
-too; prefer injecting a fresh code just before use.
+Only when the user explicitly asks to see that value — it enters the transcript and the
+model provider's context. Verification codes are secrets too; resolve them right before use.
 
-## Startup credentials
+## Startup secrets (API keys)
 
-The plugin registers `secrets.apple_passwords`. Configure explicit ENV_VAR-to-reference
-mappings in the active profile's config.yaml; see the plugin README. Startup is
-non-interactive and does not cache plaintext to disk. Do not map short-lived OTPs as
-long-lived startup credentials. Never overwrite the user's other secret sources.
+Same flow as 1Password's `hermes secrets onepassword`:
+`hermes apple-passwords setup`, `set ENV_VAR REF`, `sync` (dry run), `remove ENV_VAR`,
+`disable`. Values load at the next Hermes start. Don't map OTPs as startup secrets and
+don't overwrite the user's other secret sources. Changing their config needs their OK.
 
 ## Limits
 
-The plugin has no passkey, SSH-agent, shared-vault administration, or service-account
-mode. It does not automatically register as a Hermes browser-vault provider; current
-Hermes lacks a public registration hook for that. Use command/template injection for
-the user's specified task; do not put a raw password into browser tool arguments.
+No whole-vault listing (Apple's bridge is per-site), no passkeys, no creating or editing
+passwords, no service accounts or headless use: the user's Mac must be logged in with the
+bridge paired.

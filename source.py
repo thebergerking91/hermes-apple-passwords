@@ -1,203 +1,224 @@
 """Hermes secret-source adapter for the local Apple Passwords bridge.
 
-The bridge is invoked as a separate Python process for each operation. Secret
-values are returned only to the caller and are never logged or cached here.
+Mirrors Hermes's built-in 1Password source: ``secrets.apple_passwords.env`` maps
+env-var names to ``applepw://`` references, resolved in ONE worker call. Invalid
+entries and per-reference failures become warnings; only a pull that resolves
+nothing is a failure. Values are cached in memory only (never on disk), and
+this module never writes ``os.environ`` — the orchestrator applies results.
 """
 
 from __future__ import annotations
 
-import json
 import math
-import os
 import re
-import subprocess
-import sys
+import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
-try:  # Package plugin load and direct ``python cli.py`` execution are both supported.
-    from . import backend
+try:  # Package plugin load and direct script execution are both supported.
+    from . import backend, bridge
 except ImportError:  # pragma: no cover - exercised by direct plugin CLI invocation
     import backend  # type: ignore[no-redef]
+    import bridge  # type: ignore[no-redef]
 
 from agent.secret_sources.base import (
     SECRET_SOURCE_API_VERSION,
     ErrorKind,
     FetchResult,
     SecretSource,
-    run_secret_cli,
+    coerce_float,
 )
 
 
-_BACKEND = Path(__file__).with_name("backend.py")
-_DEFAULT_TOTAL_TIMEOUT = 45.0
-_MAX_TOTAL_TIMEOUT = 120.0
-_DEFAULT_CALL_TIMEOUT = 20.0
+BridgeError = bridge.BridgeError
+FIXED_MESSAGES = bridge.FIXED_MESSAGES
+
+_DEFAULT_TIMEOUT = 45.0
+_MAX_TIMEOUT = 120.0
 _MAX_CALL_TIMEOUT = 30.0
-_FIXED_ERRORS = {
-    "not_configured": "Apple Passwords bridge is not configured.",
-    "binary_missing": "Apple Passwords bridge is unavailable.",
-    "auth_failed": "Apple Passwords rejected the request.",
-    "auth_expired": "Apple Passwords pairing has expired; pair again.",
-    "ref_invalid": "Invalid Apple Passwords reference.",
-    "network": "Could not reach the Apple Passwords bridge.",
-    "empty_value": "Apple Passwords returned an empty value.",
-    "timeout": "Apple Passwords bridge request timed out.",
-    "internal": "Apple Passwords bridge operation failed.",
+_DEFAULT_CACHE_TTL = 300.0
+_MAX_REF_LENGTH = 2048
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*", re.ASCII)
+
+_KIND_MAP = {
+    "not_paired": ErrorKind.AUTH_EXPIRED,
+    "not_running": ErrorKind.NOT_CONFIGURED,
+    "connection_lost": ErrorKind.NETWORK,
+    "dependency_missing": ErrorKind.BINARY_MISSING,
+    "unsupported_platform": ErrorKind.NOT_CONFIGURED,
+    "ref_invalid": ErrorKind.REF_INVALID,
+    "not_found": ErrorKind.REF_INVALID,
+    "ambiguous": ErrorKind.REF_INVALID,
+    "empty_value": ErrorKind.EMPTY_VALUE,
+    "auth_failed": ErrorKind.AUTH_FAILED,
+    "timeout": ErrorKind.TIMEOUT,
 }
 
+_PAIR_HINT = "Run `hermes apple-passwords pair` in a local terminal."
 
-class BridgeError(RuntimeError):
-    """Sanitized bridge failure exposed to operator callers."""
-
-    def __init__(self, kind: ErrorKind, message: str):
-        super().__init__(message)
-        self.kind = kind
+# (str(home_path), sorted mapping items) -> (monotonic expiry, secrets)
+_CACHE: dict[tuple[str, tuple[tuple[str, str], ...]], tuple[float, dict[str, str]]] = {}
+_CACHE_LOCK = threading.Lock()
 
 
-def _error_kind(value: Any) -> ErrorKind:
-    if isinstance(value, ErrorKind):
-        return value
-    value = getattr(value, "value", value)
+def to_error_kind(kind: str) -> ErrorKind:
+    """Map a worker/bridge kind onto Hermes's ErrorKind taxonomy."""
+    return _KIND_MAP.get(kind, ErrorKind.INTERNAL) if isinstance(kind, str) else ErrorKind.INTERNAL
+
+
+def clear_cache() -> None:
+    with _CACHE_LOCK:
+        _CACHE.clear()
+
+
+def _message(kind: Any) -> str:
+    return FIXED_MESSAGES.get(kind, FIXED_MESSAGES["internal"]) if isinstance(kind, str) else FIXED_MESSAGES["internal"]
+
+
+def _safe_kind(kind: Any) -> str:
+    return kind if isinstance(kind, str) and kind in FIXED_MESSAGES else "internal"
+
+
+# --- public helpers (used by the CLI) ---------------------------------------------------------
+
+
+def validate_reference(ref: Any) -> str:
+    """Return ``ref`` if it is a valid ``applepw://`` reference; else raise BridgeError(ref_invalid)."""
+    if not isinstance(ref, str) or not ref or len(ref) > _MAX_REF_LENGTH:
+        raise BridgeError("ref_invalid")
     try:
-        return ErrorKind(value if isinstance(value, str) else str(value))
-    except ValueError:
-        return ErrorKind.INTERNAL
-
-
-def _fixed_message(kind: ErrorKind) -> str:
-    return _FIXED_ERRORS.get(kind.value, _FIXED_ERRORS["internal"])
-
-
-def _validate_ref(reference: Any) -> str:
-    if not isinstance(reference, str) or not reference or len(reference) > 2048:
-        raise BridgeError(ErrorKind.REF_INVALID, _fixed_message(ErrorKind.REF_INVALID))
-    try:
-        parsed = backend.parse_reference(reference)
-    except Exception as exc:
-        kind = _error_kind(getattr(exc, "kind", "ref_invalid")) if isinstance(
-            exc, getattr(backend, "BridgeError", ())) else ErrorKind.REF_INVALID
-        raise BridgeError(kind, _fixed_message(kind)) from None
-    # The backend parser is authoritative. Guard against a permissive/buggy parser returning
-    # a falsey result for malformed input.
-    if parsed is None or parsed is False:
-        raise BridgeError(ErrorKind.REF_INVALID, _fixed_message(ErrorKind.REF_INVALID))
-    return reference
-
-
-def _run(operation: str, *arguments: str, timeout: float = _DEFAULT_CALL_TIMEOUT) -> Any:
-    """Run backend's JSON protocol and discard all untrusted subprocess diagnostics."""
-    try:
-        proc = run_secret_cli(
-            [sys.executable, str(_BACKEND), operation, *arguments],
-            timeout=max(0.1, min(float(timeout), _MAX_CALL_TIMEOUT)),
-        )
-    except subprocess.TimeoutExpired:
-        raise BridgeError(ErrorKind.TIMEOUT, _fixed_message(ErrorKind.TIMEOUT)) from None
-    except RuntimeError as exc:
-        # The shared helper's error text can contain platform paths or subprocess details.
-        kind = ErrorKind.TIMEOUT if "timed out" in str(exc).lower() else ErrorKind.BINARY_MISSING
-        raise BridgeError(kind, _fixed_message(kind)) from None
+        parsed = backend.parse_reference(ref)
     except Exception:
-        raise BridgeError(ErrorKind.INTERNAL, _fixed_message(ErrorKind.INTERNAL)) from None
+        raise BridgeError("ref_invalid") from None
+    if parsed is None or parsed is False:
+        raise BridgeError("ref_invalid")
+    return ref
 
+
+def is_startup_reference(ref: Any) -> bool:
+    """True if ``ref`` is a valid reference usable as a startup (cached) mapping.
+
+    One-time codes (``otp`` field) expire in ~30s but startup values are cached for minutes,
+    so they are only usable via ``read``/``run``/``inject``.
+    """
     try:
-        payload = json.loads(proc.stdout or "")
-    except (json.JSONDecodeError, TypeError):
-        raise BridgeError(ErrorKind.INTERNAL, _fixed_message(ErrorKind.INTERNAL)) from None
-    if not isinstance(payload, dict) or not isinstance(payload.get("ok"), bool):
-        raise BridgeError(ErrorKind.INTERNAL, _fixed_message(ErrorKind.INTERNAL))
-    if proc.returncode != 0 or not payload["ok"]:
-        kind = _error_kind(payload.get("kind", "internal"))
-        raise BridgeError(kind, _fixed_message(kind))
-    return payload.get("result")
+        parsed = backend.parse_reference(validate_reference(ref))
+    except Exception:
+        return False
+    return getattr(parsed, "field", None) != "otp"
 
 
-def _resolve_mapping(mapping: dict[str, str], *, total_timeout: float) -> dict[str, str]:
-    """Resolve refs all-or-none under one bounded deadline."""
-    validated: dict[str, str] = {}
-    for key, reference in mapping.items():
-        if not isinstance(key, str):
-            raise BridgeError(ErrorKind.REF_INVALID, _fixed_message(ErrorKind.REF_INVALID))
-        validated[key] = _validate_ref(reference)
-
-    deadline = time.monotonic() + max(0.1, min(total_timeout, _MAX_TOTAL_TIMEOUT))
+def _resolve(refs: Sequence[str], timeout: float) -> tuple[dict[str, str], dict[str, str]]:
+    """One batched worker call for already-validated, unique refs."""
+    result = bridge.run_worker("resolve", list(refs), timeout=timeout)
+    if (not isinstance(result, dict) or not isinstance(result.get("values"), dict)
+            or not isinstance(result.get("errors"), dict)):
+        raise BridgeError("internal")
+    raw_values, raw_errors = result["values"], result["errors"]
     values: dict[str, str] = {}
-    for key, reference in validated.items():
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise BridgeError(ErrorKind.TIMEOUT, _fixed_message(ErrorKind.TIMEOUT))
-        value = _run("resolve", reference, timeout=min(_MAX_CALL_TIMEOUT, remaining))
-        if not isinstance(value, str) or not value or "\0" in value:
-            raise BridgeError(ErrorKind.EMPTY_VALUE, _fixed_message(ErrorKind.EMPTY_VALUE))
-        values[key] = value
-    return values
+    errors: dict[str, str] = {}
+    for ref in refs:
+        value = raw_values.get(ref)
+        if ref in raw_errors:
+            errors[ref] = _safe_kind(raw_errors[ref])
+        elif value is None and ref not in raw_values:
+            errors[ref] = "internal"
+        elif not isinstance(value, str) or not value or "\0" in value:
+            errors[ref] = "empty_value"
+        else:
+            values[ref] = value
+    return values, errors
 
 
-def resolve_reference(reference: str) -> str:
-    """Resolve one reference. The secret value is returned only to the caller."""
-    return _resolve_mapping({"value": reference}, total_timeout=_DEFAULT_TOTAL_TIMEOUT)["value"]
+def resolve_references(refs: Sequence[str], *,
+                       timeout: float = _DEFAULT_TIMEOUT) -> tuple[dict[str, str], dict[str, str]]:
+    """Resolve refs in one worker call: ``(values by ref, error kind by ref)``.
+
+    Validates every ref first; raises BridgeError on a global failure.
+    """
+    unique = list(dict.fromkeys(validate_reference(ref) for ref in refs))
+    if not unique:
+        return {}, {}
+    return _resolve(unique, timeout)
 
 
-def fetch_values(mapping: dict[str, str]) -> dict[str, str]:
-    """Resolve arbitrary caller keys to values; suitable for CLI templates/injection."""
-    if not isinstance(mapping, dict):
-        raise BridgeError(ErrorKind.REF_INVALID, _fixed_message(ErrorKind.REF_INVALID))
-    return _resolve_mapping(mapping, total_timeout=_DEFAULT_TOTAL_TIMEOUT)
+def resolve_reference(ref: str) -> str:
+    """Resolve one reference; the value is returned only to the caller."""
+    values, errors = resolve_references([ref])
+    if ref in errors:
+        raise BridgeError(errors[ref])
+    value = values.get(ref)
+    if not isinstance(value, str):
+        raise BridgeError("internal")
+    return value
 
 
-def bridge_status() -> dict[str, Any]:
-    result = _run("status")
+def bridge_status() -> dict[str, bool]:
+    """Strict-bool ``dependency/running/bridge/paired`` flags; no spawn when apwlib is missing."""
+    keys = ("dependency", "running", "bridge", "paired")
+    if not bridge.dependency_available():
+        return {key: False for key in keys}
+    result = bridge.run_worker("status")
     if not isinstance(result, dict):
-        raise BridgeError(ErrorKind.INTERNAL, _fixed_message(ErrorKind.INTERNAL))
-    return {key: result[key] for key in ("running", "bridge", "paired")
-            if isinstance(result.get(key), bool)}
+        raise BridgeError("internal")
+    return {key: result.get(key) is True for key in keys}
 
 
-def list_accounts(domain: str) -> list[dict[str, str]]:
-    if not isinstance(domain, str) or not domain:
-        raise BridgeError(ErrorKind.REF_INVALID, _fixed_message(ErrorKind.REF_INVALID))
+def list_accounts(domain: str) -> list[dict[str, Any]]:
+    """Metadata-only rows (host, hosts, username, has_otp) for Apple's matches of ``domain``."""
     try:
         normalized = backend.normalize_domain(domain)
-    except Exception as exc:
-        kind = _error_kind(getattr(exc, "kind", "ref_invalid")) if isinstance(
-            exc, getattr(backend, "BridgeError", ())) else ErrorKind.REF_INVALID
-        raise BridgeError(kind, _fixed_message(kind)) from None
-    if not isinstance(normalized, str) or not normalized or len(normalized) > 253:
-        raise BridgeError(ErrorKind.REF_INVALID, _fixed_message(ErrorKind.REF_INVALID))
-    result = _run("list", normalized)
-    accounts = result
-    if not isinstance(accounts, list):
-        raise BridgeError(ErrorKind.INTERNAL, _fixed_message(ErrorKind.INTERNAL))
-    clean: list[dict[str, str]] = []
-    for account in accounts:
-        if not isinstance(account, dict):
-            raise BridgeError(ErrorKind.INTERNAL, _fixed_message(ErrorKind.INTERNAL))
-        item_domain, username = account.get("domain"), account.get("username")
-        if not isinstance(item_domain, str) or not isinstance(username, str):
-            raise BridgeError(ErrorKind.INTERNAL, _fixed_message(ErrorKind.INTERNAL))
-        clean.append({"domain": item_domain, "username": username})
+    except Exception:
+        raise BridgeError("ref_invalid") from None
+    if not isinstance(normalized, str) or not normalized:
+        raise BridgeError("ref_invalid")
+    rows = bridge.run_worker("list", [normalized])
+    if not isinstance(rows, list):
+        raise BridgeError("internal")
+    clean: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise BridgeError("internal")
+        host, username = row.get("host"), row.get("username")
+        if not isinstance(host, str) or not host or not isinstance(username, str):
+            raise BridgeError("internal")
+        hosts = row.get("hosts")
+        hosts = [h for h in hosts if isinstance(h, str) and h] if isinstance(hosts, list) else []
+        clean.append({"host": host, "hosts": hosts or [host], "username": username,
+                      "has_otp": row.get("has_otp") is True})
     return clean
 
 
-def pair_interactive() -> Any:
-    """Run pairing in a clean child process with the user's terminal attached."""
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        raise BridgeError(ErrorKind.NOT_CONFIGURED, "Pairing requires an interactive terminal.")
-    keep = ("PATH", "HOME", "USER", "USERPROFILE", "LOGNAME", "SHELL", "TMPDIR", "TEMP",
-            "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT", "WINDIR")
-    child_env = {key: os.environ[key] for key in keep if key in os.environ}
-    try:
-        proc = subprocess.run([sys.executable, str(_BACKEND), "pair"], env=child_env,
-                              stdin=None, stdout=None, stderr=None, timeout=240, check=False)
-    except subprocess.TimeoutExpired:
-        raise BridgeError(ErrorKind.TIMEOUT, _fixed_message(ErrorKind.TIMEOUT)) from None
-    except Exception:
-        raise BridgeError(ErrorKind.INTERNAL, _fixed_message(ErrorKind.INTERNAL)) from None
-    if proc.returncode != 0:
-        raise BridgeError(ErrorKind.AUTH_FAILED, _fixed_message(ErrorKind.AUTH_FAILED))
-    return {"paired": True}
+# --- secret source ----------------------------------------------------------------------------
+
+
+def _validate_mapping(env_map: Any) -> tuple[dict[str, str], list[str]]:
+    """``(valid env→ref, warnings)``; invalid entries are skipped, never fatal."""
+    valid: dict[str, str] = {}
+    warnings: list[str] = []
+    if not isinstance(env_map, dict):
+        return valid, warnings
+    for name, ref in env_map.items():
+        if not isinstance(name, str) or not _ENV_NAME.fullmatch(name):
+            warnings.append(f"Skipping {name!r}: not a valid env-var name")
+            continue
+        try:
+            checked = validate_reference(ref)
+        except BridgeError:
+            warnings.append(f"Skipping {name!r}: not a valid applepw:// reference")
+            continue
+        if not is_startup_reference(checked):
+            warnings.append(f"Skipping {name}: one-time codes can't be startup secrets; "
+                            "use `hermes apple-passwords run` or `read` instead")
+            continue
+        valid[name] = checked
+    return valid, warnings
+
+
+def _cache_ttl(cfg: dict) -> float:
+    ttl = coerce_float(cfg.get("cache_ttl_seconds", _DEFAULT_CACHE_TTL), _DEFAULT_CACHE_TTL)
+    return ttl if math.isfinite(ttl) else _DEFAULT_CACHE_TTL
 
 
 class ApplePasswordsSource(SecretSource):
@@ -208,70 +229,115 @@ class ApplePasswordsSource(SecretSource):
     label = "Apple Passwords"
     shape = "mapped"
     scheme = "applepw"
-    override_existing_default = False
+    # An explicit VAR→applepw:// binding is the strongest user intent (1Password parity).
+    override_existing_default = True
     remediation_hints = {
-        ErrorKind.NOT_CONFIGURED: "Run `hermes apple-passwords status` and pair with `hermes apple-passwords pair`.",
-        ErrorKind.AUTH_FAILED: "Run `hermes apple-passwords pair` to refresh the local pairing.",
-        ErrorKind.AUTH_EXPIRED: "Run `hermes apple-passwords pair` to refresh the local pairing.",
-        ErrorKind.BINARY_MISSING: "Run `hermes apple-passwords status` to check the local bridge installation.",
+        ErrorKind.AUTH_EXPIRED: _PAIR_HINT,
+        ErrorKind.NOT_CONFIGURED: _PAIR_HINT,
+        ErrorKind.AUTH_FAILED: _PAIR_HINT,
+        ErrorKind.BINARY_MISSING: "apwlib is not installed for Hermes — run `hermes pm repair`, then restart Hermes.",
+        ErrorKind.REF_INVALID: "Run `hermes apple-passwords list DOMAIN` to find the exact saved host and username.",
     }
 
     def is_enabled(self, cfg: dict) -> bool:
         return bool(isinstance(cfg, dict) and cfg.get("enabled") is True)
 
-    def override_existing(self, cfg: dict) -> bool:
-        return bool(isinstance(cfg, dict) and cfg.get("override_existing") is True)
+    def remediation(self, kind: ErrorKind | None, cfg: dict) -> str:
+        # NOT_CONFIGURED covers both "no mappings yet" and "bridge not running"; only the
+        # latter is fixed by pairing.
+        if kind is ErrorKind.NOT_CONFIGURED and isinstance(cfg, dict) and not _validate_mapping(cfg.get("env"))[0]:
+            return "Map a credential with `hermes apple-passwords set ENV_VAR applepw://HOST/USERNAME/password`."
+        return super().remediation(kind, cfg)
 
     def fetch_timeout_seconds(self, cfg: dict) -> float:
-        raw = cfg.get("timeout_seconds", _DEFAULT_TOTAL_TIMEOUT) if isinstance(cfg, dict) else _DEFAULT_TOTAL_TIMEOUT
-        try:
-            value = float(raw)
-        except (TypeError, ValueError, OverflowError):
-            value = _DEFAULT_TOTAL_TIMEOUT
+        raw = cfg.get("timeout_seconds", _DEFAULT_TIMEOUT) if isinstance(cfg, dict) else _DEFAULT_TIMEOUT
+        if isinstance(raw, bool):
+            return _DEFAULT_TIMEOUT
+        value = coerce_float(raw, _DEFAULT_TIMEOUT)
         if not math.isfinite(value) or value <= 0:
-            value = _DEFAULT_TOTAL_TIMEOUT
-        return min(value, _MAX_TOTAL_TIMEOUT)
+            return _DEFAULT_TIMEOUT
+        return min(value, _MAX_TIMEOUT)
 
     def config_schema(self) -> dict:
         return {
             "enabled": {"description": "Resolve configured Apple Passwords references", "default": False},
-            "env": {"description": "Map environment variable names to applepw:// references", "default": {}},
-            "timeout_seconds": {"description": "Total bridge-fetch deadline (maximum 120 seconds)", "default": _DEFAULT_TOTAL_TIMEOUT},
-            "override_existing": {"description": "Allow values to replace existing environment values", "default": False},
+            "env": {"description": "Map of ENV_VAR -> applepw://HOST/USERNAME/FIELD reference", "default": {}},
+            "override_existing": {"description": "Resolved values overwrite .env/shell values", "default": True},
+            "timeout_seconds": {"description": "Total fetch deadline (maximum 120 seconds)",
+                                "default": int(_DEFAULT_TIMEOUT)},
+            "cache_ttl_seconds": {"description": "In-memory cache TTL; 0 disables",
+                                  "default": int(_DEFAULT_CACHE_TTL)},
         }
 
     def fetch(self, cfg: dict, home_path: Path) -> FetchResult:
-        del home_path  # The bridge has a fixed local user pairing; no per-Hermes-home state.
         result = FetchResult()
+        try:
+            return self._fetch(cfg, home_path, result)
+        except Exception:
+            result.secrets = {}
+            return result.fail(FIXED_MESSAGES["internal"], ErrorKind.INTERNAL)
+
+    def _fetch(self, cfg: dict, home_path: Path, result: FetchResult) -> FetchResult:
         if not isinstance(cfg, dict):
-            return result.fail("Apple Passwords configuration is invalid.", ErrorKind.NOT_CONFIGURED)
+            return result.fail("secrets.apple_passwords configuration is invalid.", ErrorKind.NOT_CONFIGURED)
         if "enabled" in cfg and not isinstance(cfg["enabled"], bool):
-            return result.fail("Apple Passwords enabled setting must be true or false.",
+            return result.fail("secrets.apple_passwords.enabled must be true or false.",
                                ErrorKind.NOT_CONFIGURED)
         if not self.is_enabled(cfg):
             return result
-        mapping = cfg.get("env")
-        if not isinstance(mapping, dict) or not mapping:
-            return result.fail("Add environment-variable to applepw:// reference mappings.",
-                               ErrorKind.NOT_CONFIGURED)
-        for name, reference in mapping.items():
-            if (not isinstance(name, str)
-                    or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name, flags=re.ASCII)):
-                return result.fail("Apple Passwords mapping contains an invalid environment variable name.",
-                                   ErrorKind.REF_INVALID)
-            try:
-                _validate_ref(reference)
-            except BridgeError as exc:
-                return result.fail(str(exc), exc.kind)
 
-        timeout = self.fetch_timeout_seconds(cfg)
+        valid, warnings = _validate_mapping(cfg.get("env"))
+        result.warnings.extend(warnings)
+        if not valid:
+            return result.fail("secrets.apple_passwords.enabled is true but no valid mappings are configured. "
+                               "Add ENV_VAR → applepw:// mappings with `hermes apple-passwords set`.",
+                               ErrorKind.NOT_CONFIGURED)
+
+        if not bridge.dependency_available():
+            return result.fail(FIXED_MESSAGES["dependency_missing"], ErrorKind.BINARY_MISSING)
+
+        ttl = _cache_ttl(cfg)
+        cache_key = (str(home_path), tuple(sorted(valid.items())))
+        if ttl > 0:
+            with _CACHE_LOCK:
+                hit = _CACHE.get(cache_key)
+                if hit is not None and hit[0] <= time.monotonic():
+                    del _CACHE[cache_key]
+                    hit = None
+            if hit is not None:
+                result.secrets = dict(hit[1])
+                return result
+
+        budget = self.fetch_timeout_seconds(cfg)
+        unique_refs = list(dict.fromkeys(valid.values()))
         try:
-            result.secrets = _resolve_mapping(mapping, total_timeout=timeout)
+            values, errors = _resolve(unique_refs, min(_MAX_CALL_TIMEOUT, budget))
         except BridgeError as exc:
-            # All-or-none: discard any values resolved before an error.
-            result.secrets.clear()
-            return result.fail(str(exc), exc.kind)
-        except Exception:
-            result.secrets.clear()
-            return result.fail(_fixed_message(ErrorKind.INTERNAL), ErrorKind.INTERNAL)
+            return result.fail(str(exc), to_error_kind(exc.kind))
+
+        secrets: dict[str, str] = {}
+        first_error: tuple[str, str] | None = None
+        error_count = 0
+        for env_name in sorted(valid):
+            ref = valid[env_name]
+            if ref in values:
+                secrets[env_name] = values[ref]
+                continue
+            kind = errors.get(ref, "internal")
+            error_count += 1
+            message = _message(kind)
+            result.warnings.append(f"{env_name}: {message}")
+            if first_error is None:
+                first_error = (kind, f"{env_name}: {message}")
+
+        if not secrets and first_error is not None:
+            return result.fail(first_error[1], to_error_kind(first_error[0]))
+
+        result.secrets = secrets
+        if ttl > 0 and not error_count and secrets:
+            with _CACHE_LOCK:
+                now = time.monotonic()
+                for key in [k for k, (expiry, _) in _CACHE.items() if expiry <= now]:
+                    del _CACHE[key]
+                _CACHE[cache_key] = (now + ttl, dict(secrets))
         return result

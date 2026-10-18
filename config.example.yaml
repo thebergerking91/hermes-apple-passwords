@@ -1,11 +1,19 @@
 # Merge these sections into the active profile's config.yaml; preserve other entries.
+# Prefer the CLI: `hermes apple-passwords setup`, `hermes apple-passwords set ENV REF`,
+# and `hermes apple-passwords vault add DOMAIN` write these keys for you.
 plugins:
   enabled:
     - apple-passwords
 secrets:
   apple_passwords:
     enabled: true
-    override_existing: false
-    timeout_seconds: 45
+    override_existing: true    # same default as secrets.onepassword
+    timeout_seconds: 45        # whole-fetch budget, maximum 120
+    cache_ttl_seconds: 300     # in-memory only; 0 disables
     env:
       EXAMPLE_API_KEY: applepw://example.com/alice/password
+vault:
+  apple_passwords:
+    enabled: true              # browser_vault login backend (opt-in)
+    domains:                   # only these sites (and their subdomains) are listed/filled
+      - example.com

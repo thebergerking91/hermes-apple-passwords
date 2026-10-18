@@ -18,7 +18,8 @@ def main():
     source = Path(__file__).resolve().parent
     staging = Path(tempfile.mkdtemp(prefix='.apple-passwords-install-', dir=parent))
     try:
-        for name in ('__init__.py', 'backend.py', 'source.py', 'cli.py', 'plugin.yaml', 'README.md', 'SECURITY.md', 'VALIDATION.md', 'LICENSE'):
+        for name in ('__init__.py', 'backend.py', 'bridge.py', 'source.py', 'cli.py', 'vault.py', 'plugin.yaml',
+                     'README.md', 'SECURITY.md', 'VALIDATION.md', 'LICENSE'):
             shutil.copy2(source / name, staging / name)
         shutil.copytree(source / 'skills', staging / 'skills')
         # Never replace an installation created by another process in the meantime.
