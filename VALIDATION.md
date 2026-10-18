@@ -63,9 +63,9 @@ the-internet.herokuapp.com. Values were compared in code and never printed.
 | 4 | `run`: value delivered, child env = 7 base vars + mapping (plus macOS `__CF_USER_TEXT_ENCODING`), exit code 3 propagated, output suppressed / shown with `--show-output` | PASS |
 | 5 | `inject`: exact value, 0600, overwrite and symlink refused | PASS |
 | 6 | Real startup path: value applied with source label `apple_passwords`; overrides a shell value by default; kept shell value with `override_existing: false`; no value in output | PASS |
-| 7 | Bridge stop / recovery | pending (needs operator re-pair) |
+| 7 | Bridge stopped: `status` stopped/unpaired; `read` with stdin closed and a real startup failed fast with the pair hint, no PIN prompt, nothing leaked, no daemon restarted; operator re-paired and lookups recovered | PASS |
 | 8 | Exact host: parent domain `herokuapp.com` and non-saved host refused | PASS |
-| 9 | OTP and true duplicate accounts | pending (operator, by hand) |
+| 9 | OTP: `list` marks the login `otp`; `read …/otp` returned a 6-digit code equal to an independently computed TOTP for the public test key; a login without a code is refused. Duplicates: the Passwords app refuses a second login with the same username and site (offers to update instead), so exact duplicates cannot be created there; duplicate rejection stays covered by unit tests | PASS |
 | 10 | New Hermes session signed in to the-internet.herokuapp.com through `browser_vault` ("You logged into a secure area!"); fill on another origin → `origin_mismatch`; the password appears 0 times in the session's tool arguments, tool results, replies or reasoning | PASS |
 | 11 | New session loaded `apple-passwords:apple-passwords` | PASS |
 
@@ -76,6 +76,11 @@ Findings from the live run:
   `example.com`) and treats them as one account per username. The vault backend therefore allows
   each saved host's `www.` form as a fill origin (nothing else is widened); references must use the
   host `list` shows.
+- One-time-code entries report the same bare saved host (`domain: example.com`, `source: totp`).
+  The worker's parent-domain allowance for codes is therefore broader than needed: a
+  `www.example.com/…/otp` reference resolves while the matching `/password` reference is refused.
+- In both live pairing sessions the first PIN attempt after the bridge started was rejected and
+  the immediate retry succeeded (cause not yet determined).
 - Saving through apwlib (used only to create fixtures; the plugin never saves) needs a macOS
   approval. apwlib's helper times out after ~30 s, but the save lands once approved, and lookups for
   that site fail until the prompt is answered.
