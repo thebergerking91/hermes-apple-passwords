@@ -149,10 +149,6 @@ def _entry_hosts(entry: object) -> list[str]:
     return hosts
 
 
-def _is_parent(parent: str, host: str) -> bool:
-    return host.endswith("." + parent)
-
-
 def _translate_failure(exc: BaseException) -> BridgeError:
     """Map an exception to a BridgeError by class name. Never keeps upstream text."""
     if isinstance(exc, BridgeError):
@@ -277,7 +273,7 @@ def _rows_for(domain: str, queries: _Queries) -> dict[tuple[str, str], dict]:
             otp_hosts.setdefault(user, set()).add(host)
     for slot in merged.values():
         wanted = otp_hosts.get(slot["username"], set())
-        slot["has_otp"] = any(h in wanted or any(_is_parent(w, h) for w in wanted) for h in slot["hosts"])
+        slot["has_otp"] = any(h in wanted for h in slot["hosts"])
     return merged
 
 
@@ -317,7 +313,7 @@ def _entry_rows_for(domain: str, queries: _Queries) -> list[dict]:
             otp_hosts.setdefault(user, set()).add(host)
     for row in rows:
         wanted = otp_hosts.get(row["username"], set())
-        row["has_otp"] = any(h in wanted or any(_is_parent(w, h) for w in wanted) for h in row["hosts"])
+        row["has_otp"] = any(h in wanted for h in row["hosts"])
     return rows
 
 
@@ -352,8 +348,7 @@ def _resolve_one(ref: Reference, queries: _Queries) -> str:
         matches = []
         for item in queries.otp(ref.domain):
             host = _saved_host(getattr(item, "domain", None))
-            if getattr(item, "username", None) == ref.username and host is not None \
-                    and (host == ref.domain or _is_parent(host, ref.domain)):
+            if getattr(item, "username", None) == ref.username and host == ref.domain:
                 matches.append(item)
         value = _single(matches).code
     else:
@@ -422,15 +417,71 @@ def pair(daemon: object | None = None) -> dict[str, bool]:
         info = daemon.status()
         if isinstance(info, dict) and info.get("paired") is True:
             return {"paired": True}
-        daemon.request_challenge()
-        pin = getpass.getpass("Enter the six-digit PIN shown by macOS: ", stream=sys.stderr)
-        if not isinstance(pin, str) or not re.fullmatch(r"[0-9]{6}", pin) or not daemon.verify_challenge(pin):
-            raise BridgeError("auth_failed")
-        return {"paired": True}
+        for attempt in range(1, _PAIR_ATTEMPTS + 1):
+            _start_handshake(daemon)
+            pin = getpass.getpass("Enter the six-digit PIN shown by macOS: ", stream=sys.stderr)
+            if isinstance(pin, str) and re.fullmatch(r"[0-9]{6}", pin) and daemon.verify_challenge(pin):
+                return {"paired": True}
+            if attempt < _PAIR_ATTEMPTS:
+                _say("That PIN was not accepted. macOS will show a new PIN; type the newest one.")
+        raise BridgeError("auth_failed")
     except BridgeError:
         raise
     except Exception as exc:
         raise _translate_failure(exc) from None
+
+
+_PAIR_ATTEMPTS = 3
+_HANDSHAKE_READY_TIMEOUT = 45.0  # beyond apwlib's own 10 s wait; a cold helper can be slower
+_HANDSHAKE_POLL = 0.25
+
+
+def _say(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def _pairing_state(daemon: object) -> str | None:
+    """The bridge's raw handshake state, or None when this apwlib can't report it.
+
+    apwlib's public ``status()`` drops ``pairing_state``, so read the daemon's own status
+    reply. Missing support degrades to the previous behaviour (prompt immediately)."""
+    send = getattr(daemon, "_send_raw", None)
+    if not callable(send):
+        return None
+    try:
+        reply = send({"op": "status"})
+    except Exception:
+        return None
+    state = reply.get("pairing_state") if isinstance(reply, dict) else None
+    return state if isinstance(state, str) else None
+
+
+def _start_handshake(daemon: object) -> None:
+    """Ask macOS for a PIN and return only once the handshake can accept it.
+
+    apwlib waits at most 10 s for the ``MSG1Set`` state and then lets the caller continue;
+    a PIN submitted before ``MSG1Set`` wedges the handshake. On a freshly started bridge the
+    native helper can be slower than that, so keep waiting here, and re-request once if the
+    first challenge never got going."""
+    import time
+
+    started = time.monotonic()
+    _say("Asking macOS for a pairing PIN...")
+    for challenge in (1, 2):
+        daemon.request_challenge()
+        deadline = time.monotonic() + _HANDSHAKE_READY_TIMEOUT
+        state = _pairing_state(daemon)
+        if state is None:
+            return  # can't observe the handshake; behave like apwlib's own CLI
+        while state != "MSG1Set" and time.monotonic() < deadline:
+            time.sleep(_HANDSHAKE_POLL)
+            state = _pairing_state(daemon)
+        if state == "MSG1Set":
+            _say(f"macOS is ready for the PIN (after {time.monotonic() - started:.1f} s).")
+            return
+        if challenge == 1:
+            _say("macOS did not get ready; requesting a new PIN. If you see more than one, type the newest.")
+    _say("macOS still is not ready; you can try the PIN anyway, or run pair again.")
 
 
 # --------------------------------------------------------------------------- dispatch

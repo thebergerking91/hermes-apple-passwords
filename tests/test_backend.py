@@ -352,16 +352,16 @@ class ListTests(unittest.TestCase):
         rows = backend.list_accounts("example.com", client)
         self.assertEqual([r["username"] for r in rows], ["keeper"])
 
-    def test_list_has_otp_exact_and_parent_domain(self):
+    def test_list_has_otp_requires_exact_host(self):
         client = FakeClient(
             passwords=[pw("login.example.com", "alice"), pw("login.example.com", "bob"),
                        pw("other.example.com", "carol"), pw("example.com", "dave")],
             otps=[otp("login.example.com", "alice"),      # exact host
-                  otp("example.com", "bob"),               # parent domain of login.example.com
-                  otp("example.com", "carol"),             # parent of other.example.com
-                  otp("login.example.com", "dave")])       # child of dave's host: NOT a parent
+                  otp("example.com", "bob"),               # parent domain of login.example.com: NOT exact
+                  otp("example.com", "carol"),             # parent of other.example.com: NOT exact
+                  otp("login.example.com", "dave")])       # child of dave's host: NOT exact
         rows = {r["username"]: r["has_otp"] for r in backend.list_accounts("example.com", client)}
-        self.assertEqual(rows, {"alice": True, "bob": True, "carol": True, "dave": False})
+        self.assertEqual(rows, {"alice": True, "bob": False, "carol": False, "dave": False})
         self.assertIn(("list_otp", "example.com"), client.calls)
 
     def test_list_has_otp_requires_same_username(self):
@@ -434,7 +434,7 @@ class VaultListTests(unittest.TestCase):
 
             def list_otp(self, url):
                 self.calls.append(("list_otp", url))
-                return [otp("other.org", "bob")] if url == "other.org" else []
+                return [otp("login.other.org", "bob")] if url == "other.org" else []
 
         client = PerDomain()
         rows = backend.vault_list(["other.org", "example.com", "example.com"], client)
@@ -490,13 +490,18 @@ class VaultListTests(unittest.TestCase):
         self.assertEqual([(r["host"], r["has_otp"]) for r in rows],
                          [("a.example.com", True), ("b.example.com", False)])
 
+    def test_vault_list_has_otp_false_for_parent_domain_otp(self):
+        client = FakeClient([pw("www.example.com", ALICE)], otps=[otp("example.com", ALICE)])
+        rows = backend.vault_list(["example.com"], client)
+        self.assertEqual([(r["host"], r["has_otp"]) for r in rows], [("www.example.com", False)])
+
     def test_same_entry_from_two_domains_dedupes_and_ors_otp(self):
         class Two(FakeClient):
             def get_password(self, url, username=None):
                 return [pw("a.example.com", ALICE, sites=["a.example.com", "https://b.other.org"])]
 
             def list_otp(self, url):
-                return [otp("example.com", ALICE)] if url == "example.com" else []
+                return [otp("a.example.com", ALICE)] if url == "example.com" else []
 
         rows = backend.vault_list(["example.com", "other.org"], Two())
         self.assertEqual(len(rows), 1)
@@ -697,10 +702,27 @@ class ResolveOtpTests(unittest.TestCase):
                          {ref(field="otp"): "111111"})
         self.assertEqual(client.calls, [("get_otp", "example.com")])
 
-    def test_parent_domain_match(self):
+    def test_www_ref_refused_when_otp_saved_on_bare_host(self):
         client = FakeClient(otps=[otp("example.com", code="222222")])
+        out = backend.resolve_many([ref("www.example.com", field="otp")], client)
+        self.assertEqual(out["values"], {})
+        self.assertEqual(out["errors"], {ref("www.example.com", field="otp"): "not_found"})
+
+    def test_subdomain_ref_refused_for_otp_saved_on_parent(self):
+        client = FakeClient(otps=[otp("example.com", code="222222")])
+        out = backend.resolve_many([ref("a.example.com", field="otp")], client)
+        self.assertEqual(out["values"], {})
+        self.assertEqual(out["errors"], {ref("a.example.com", field="otp"): "not_found"})
+
+    def test_deep_subdomain_ref_refused_for_otp_saved_on_parent(self):
+        client = FakeClient(otps=[otp("example.com", code="222222")])
+        out = backend.resolve_many([ref("a.b.example.com", field="otp")], client)
+        self.assertEqual(out["errors"], {ref("a.b.example.com", field="otp"): "not_found"})
+
+    def test_exact_subdomain_host_resolves(self):
+        client = FakeClient(otps=[otp("login.example.com", code="444444"), otp("example.com", code="222222")])
         self.assertEqual(backend.resolve_many([ref("login.example.com", field="otp")], client)["values"],
-                         {ref("login.example.com", field="otp"): "222222"})
+                         {ref("login.example.com", field="otp"): "444444"})
 
     def test_child_or_sibling_domain_does_not_match(self):
         client = FakeClient(otps=[otp("deep.login.example.com"), otp("other.example.com")])
@@ -718,7 +740,7 @@ class ResolveOtpTests(unittest.TestCase):
                          {ref(field="otp"): "not_found"})
 
     def test_ambiguous_otp(self):
-        client = FakeClient(otps=[otp("example.com", code="1"), otp("login.example.com", code="2")])
+        client = FakeClient(otps=[otp("login.example.com", code="1"), otp("https://login.example.com/", code="2")])
         out = backend.resolve_many([ref("login.example.com", field="otp")], client)
         self.assertEqual(out["errors"], {ref("login.example.com", field="otp"): "ambiguous"})
         self.assertEqual(out["values"], {})
@@ -1017,6 +1039,86 @@ class PairTests(unittest.TestCase):
                 self.assertRaises(backend.BridgeError) as caught:
             backend.pair(d)
         self.assertEqual(caught.exception.kind, "auth_failed")
+
+    def test_rejected_pin_retries_with_fresh_challenge_then_succeeds(self):
+        # Live finding: a PIN typed into the wrong window is rejected; the command should
+        # ask for a new PIN instead of exiting.
+        d = FakeDaemon()
+        results = iter([False, True])
+        d.verify_challenge = lambda pin: (d.calls.append(("verify_challenge", pin)), next(results))[1]
+        pins = iter(["111111", "222222"])
+        with mock.patch.object(backend.getpass, "getpass", lambda *a, **k: next(pins)), \
+                mock.patch.object(backend.sys, "stderr", io.StringIO()) as err:
+            self.assertEqual(backend.pair(d), {"paired": True})
+        self.assertEqual(d.calls.count("request_challenge"), 2)
+        self.assertIn("type the newest", err.getvalue())
+
+    def test_rejected_pin_gives_up_after_three_attempts(self):
+        d = FakeDaemon(paired_after_verify=False)
+        with mock.patch.object(backend.getpass, "getpass", lambda *a, **k: "123456"), \
+                mock.patch.object(backend.sys, "stderr", io.StringIO()), \
+                self.assertRaises(backend.BridgeError) as caught:
+            backend.pair(d)
+        self.assertEqual(caught.exception.kind, "auth_failed")
+        self.assertEqual(d.calls.count("request_challenge"), 3)
+
+    def _stateful_daemon(self, states):
+        """FakeDaemon whose raw status reports a sequence of handshake states."""
+        d = FakeDaemon()
+        feed = iter(states)
+        last = {"state": None}
+
+        def send_raw(message):
+            assert message == {"op": "status"}
+            last["state"] = next(feed, last["state"])
+            return {"running": True, "bridge": True, "paired": False, "pairing_state": last["state"]}
+
+        d._send_raw = send_raw
+        return d
+
+    def test_waits_for_slow_helper_before_prompting(self):
+        # Cold bridge: apwlib gives up waiting after 10 s; the plugin keeps waiting for MSG1Set.
+        d = self._stateful_daemon(["ChallengeSent"] * 5 + ["MSG1Set"])
+        order = []
+        d_verify = d.verify_challenge
+        d.verify_challenge = lambda pin: (order.append("verify"), d_verify(pin))[1]
+
+        def fake_getpass(*_a, **_k):
+            order.append(("prompt", d.calls.count("request_challenge")))
+            return "123456"
+
+        import time as time_module
+        with mock.patch.object(time_module, "sleep", lambda s: None), \
+                mock.patch.object(backend.getpass, "getpass", fake_getpass), \
+                mock.patch.object(backend.sys, "stderr", io.StringIO()) as err:
+            self.assertEqual(backend.pair(d), {"paired": True})
+        self.assertEqual(order, [("prompt", 1), "verify"])
+        self.assertIn("macOS is ready for the PIN", err.getvalue())
+
+    def test_rechallenges_once_when_helper_never_gets_ready(self):
+        d = self._stateful_daemon(["ChallengeSent"] * 10_000)
+        clock = {"t": 0.0}
+
+        def fake_monotonic():
+            clock["t"] += 5.0
+            return clock["t"]
+
+        import time as time_module
+        with mock.patch.object(time_module, "sleep", lambda s: None), \
+                mock.patch.object(time_module, "monotonic", fake_monotonic), \
+                mock.patch.object(backend.getpass, "getpass", lambda *a, **k: "123456"), \
+                mock.patch.object(backend.sys, "stderr", io.StringIO()) as err:
+            self.assertEqual(backend.pair(d), {"paired": True})
+        self.assertEqual(d.calls.count("request_challenge"), 2)
+        self.assertIn("requesting a new PIN", err.getvalue())
+        self.assertIn("not ready", err.getvalue())
+
+    def test_unobservable_state_keeps_apwlib_behaviour(self):
+        d = FakeDaemon()  # no _send_raw: older/other apwlib
+        with mock.patch.object(backend.getpass, "getpass", lambda *a, **k: "123456"), \
+                mock.patch.object(backend.sys, "stderr", io.StringIO()):
+            self.assertEqual(backend.pair(d), {"paired": True})
+        self.assertEqual(d.calls, ["start", "status", "request_challenge", ("verify_challenge", "123456")])
 
     def test_apwlib_errors_are_mapped(self):
         cases = [
