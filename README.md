@@ -12,10 +12,10 @@ works:
 
 It does not create a replacement password vault.
 
-**Status: experimental, pending live macOS validation.** The automated suite exercises
-parsing, selection, isolation and the real Hermes loader, CLI dispatch, secret orchestrator
-and browser vault, but it cannot prove Apple's browser bridge works on your macOS/browser
-combination. See VALIDATION.md.
+**Status: functional (v0.2.0), validated on one Mac.** The full real-Mac checklist passed on
+macOS 27.0.1 with Google Chrome 155 against Hermes `d923a5eb48`, including a real browser
+sign-in through `browser_vault`. Apple's bridge is unofficial, so other macOS/browser
+combinations and future Apple changes are unverified. See VALIDATION.md.
 
 ## How it maps to Hermes's 1Password integration
 
