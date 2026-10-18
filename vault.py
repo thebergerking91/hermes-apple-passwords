@@ -86,6 +86,22 @@ def _in_scope(host: str, domains: list[str]) -> bool:
     return any(host == d or host.endswith("." + d) for d in domains)
 
 
+def _origins_for(hosts: list[str]) -> tuple:
+    """Exact fill origins for one Apple entry's saved hosts.
+
+    Apple Passwords strips a leading ``www.`` when it saves a login (verified live: a save
+    for www.example.com is stored as example.com) and autofills it on both. So each saved
+    host also allows its ``www.`` form, exactly as Apple does; nothing else is inferred.
+    """
+    out: list[str] = []
+    for host in hosts:
+        for candidate in (host, host if host.startswith("www.") else f"www.{host}"):
+            origin = f"https://{candidate}"
+            if origin not in out:
+                out.append(origin)
+    return tuple(out)
+
+
 def _make_handle(host: str, username: str) -> str:
     return f"{PREFIX}{host}/{quote(username, safe='')}"
 
@@ -208,7 +224,7 @@ def _backend_class() -> type:
                     origin=f"https://{host}", created_at="",
                     identifier_type="email" if "@" in username else "username",
                     identifier=username, has_otp=row.get("has_otp") is True,
-                    allowed_origins=tuple(f"https://{h}" for h in scoped))
+                    allowed_origins=_origins_for(scoped))
 
             def list_items(self) -> list[VaultItemMeta]:
                 return self._rows(self.domains)

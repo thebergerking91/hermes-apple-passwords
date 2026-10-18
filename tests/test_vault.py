@@ -230,7 +230,11 @@ class VaultBackendTests(unittest.TestCase):
         self.assertEqual(alice["two_factor"], "automatic")
         bob = mine["applepw:login.example.com/bob"]
         self.assertEqual(bob["identifier_type"], "username")
-        self.assertEqual(bob["allowed_origins"], ["https://login.example.com", "https://www.example.com"])
+        # Bob's own in-scope hosts are login.example.com and www.example.com (evil.com is
+        # out of scope). Each gets its www. form (www.example.com already is one), in
+        # host-then-www order per host with hosts sorted; evil.com never appears.
+        self.assertEqual(bob["allowed_origins"], ["https://login.example.com", "https://www.login.example.com",
+                                                  "https://www.example.com"])
         self.assertNotIn("evil.com", out)
         self.assertEqual(calls, [("vault-list", ["example.com"])])  # list never resolves secrets
         self.assertNotIn("errors", data)
@@ -256,15 +260,20 @@ class VaultBackendTests(unittest.TestCase):
         self.vault.install()
         items = {m.id: m for m in self.apple_backend().list_items()}
         self.assertEqual(set(items), {"applepw:a.example.com/u", "applepw:c.example.com/u"})
-        self.assertEqual(items["applepw:a.example.com/u"].allowed_origins, ("https://a.example.com",))
-        self.assertEqual(items["applepw:c.example.com/u"].allowed_origins, ("https://c.example.com",))
+        # Each entry gets only its own in-scope host plus that host's www. form: A never
+        # gets C's hosts and vice versa.
+        self.assertEqual(items["applepw:a.example.com/u"].allowed_origins,
+                         ("https://a.example.com", "https://www.a.example.com"))
+        self.assertEqual(items["applepw:c.example.com/u"].allowed_origins,
+                         ("https://c.example.com", "https://www.c.example.com"))
         data = json.loads(browser_vault_tool.browser_vault_list())
         mine = {i["handle"]: i for i in data["items"] if i["backend"] == "apple_passwords"}
-        # The tool omits allowed_origins when it is just the item's own origin.
-        for host in ("a.example.com", "c.example.com"):
+        for host, other in (("a.example.com", "c.example.com"), ("c.example.com", "a.example.com")):
             entry = mine[f"applepw:{host}/u"]
             self.assertEqual(entry["origin"], f"https://{host}")
-            self.assertEqual(entry.get("allowed_origins", [entry["origin"]]), [f"https://{host}"])
+            self.assertEqual(entry.get("allowed_origins", [entry["origin"]]),
+                             [f"https://{host}", f"https://www.{host}"])
+            self.assertNotIn(other, json.dumps(entry))
 
     def test_cross_entry_rows_with_same_first_in_scope_host_are_both_dropped(self):
         self.section = {"enabled": True, "domains": ["a.example.com", "c.example.com"]}
@@ -289,17 +298,51 @@ class VaultBackendTests(unittest.TestCase):
         self.vault.install()
         own = {}
         for r in rows:
-            own[(sorted(h for h in r["hosts"] if h.endswith("example.com"))[0], r["username"])] = {
-                f"https://{h}" for h in r["hosts"] if h.endswith("example.com")}
+            in_scope = [h for h in r["hosts"] if h.endswith("example.com")]
+            # Expected: each of the row's own in-scope hosts plus its www. form; nothing else.
+            own[(sorted(in_scope)[0], r["username"])] = (
+                {f"https://{h}" for h in in_scope}
+                | {f"https://{h if h.startswith('www.') else 'www.' + h}" for h in in_scope})
         items = self.apple_backend().list_items()
         self.assertEqual(len(items), 4)
         for m in items:
             host, _, user = m.id[len("applepw:"):].partition("/")
             self.assertEqual(set(m.allowed_origins), own[(host, user)])
             self.assertEqual(m.origin, f"https://{host}")
-            self.assertIn(m.origin, m.allowed_origins)
-            self.assertEqual(list(m.allowed_origins), sorted(m.allowed_origins))
-        self.assertNotIn("https://evil.com", {o for m in items for o in m.allowed_origins})
+            self.assertEqual(m.allowed_origins[0], m.origin)
+            self.assertEqual(len(m.allowed_origins), len(set(m.allowed_origins)))  # deduped
+        all_origins = {o for m in items for o in m.allowed_origins}
+        self.assertNotIn("https://evil.com", all_origins)
+        self.assertNotIn("https://www.evil.com", all_origins)
+        # The apex is never inferred from a www. host (or any other direction).
+        self.assertNotIn("https://example.com", all_origins)
+        # Entry B (b.example.com) must not receive A's, Z's or X's hosts.
+        by_id = {m.id: m for m in items}
+        self.assertEqual(by_id["applepw:b.example.com/u1"].allowed_origins,
+                         ("https://b.example.com", "https://www.b.example.com"))
+
+    def test_apex_host_also_allows_its_www_form(self):
+        self.worker(rows=[row("example.com", "u", hosts=["example.com"])])
+        self.vault.install()
+        (item,) = self.apple_backend().list_items()
+        self.assertEqual(item.allowed_origins, ("https://example.com", "https://www.example.com"))
+
+    def test_www_host_is_not_doubled_and_does_not_widen_to_apex(self):
+        self.worker(rows=[row("www.example.com", "u", hosts=["www.example.com"])])
+        self.vault.install()
+        (item,) = self.apple_backend().list_items()
+        self.assertEqual(item.id, "applepw:www.example.com/u")
+        self.assertEqual(item.allowed_origins, ("https://www.example.com",))
+        self.assertNotIn("https://www.www.example.com", item.allowed_origins)
+        self.assertNotIn("https://example.com", item.allowed_origins)
+
+    def test_subdomain_gets_only_its_own_www_form_never_the_parent(self):
+        self.worker(rows=[row("a.example.com", "u", hosts=["a.example.com"])])
+        self.vault.install()
+        (item,) = self.apple_backend().list_items()
+        self.assertEqual(item.allowed_origins, ("https://a.example.com", "https://www.a.example.com"))
+        self.assertNotIn("https://example.com", item.allowed_origins)
+        self.assertNotIn("https://www.example.com", item.allowed_origins)
 
     def test_list_failures_become_fixed_runtime_errors(self):
         self.vault.install()
@@ -337,7 +380,7 @@ class VaultBackendTests(unittest.TestCase):
         handle = "applepw:login.example.com/a%20b%40c.com"
         meta = backend.get_meta(handle)
         self.assertEqual((meta.id, meta.identifier, meta.has_otp), (handle, "a b@c.com", True))
-        self.assertEqual(meta.allowed_origins, ("https://login.example.com",))
+        self.assertEqual(meta.allowed_origins, ("https://login.example.com", "https://www.login.example.com"))
         self.assertEqual(calls, [("vault-list", ["example.com"])])
         self.assertIsNone(backend.get_meta("applepw:login.example.com/someone-else"))
 

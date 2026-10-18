@@ -5,7 +5,7 @@ bridge**. Nothing below has read a live password vault.
 
 ## Automated checks (2026-10-18)
 
-**311 tests passed, 0 skipped** with `python -m unittest discover -s tests` on macOS 27.0.1
+**314 tests passed, 0 skipped** with `python -m unittest discover -s tests` on macOS 27.0.1
 (arm64), Python 3.14.7 (Hermes's bundled runtime), against Hermes
 `d923a5eb487a17c0a68801bba9ef0f56c81040a8`. pytest was not installed in that environment
 and was not run.
@@ -47,7 +47,40 @@ ref; `read`, `list` and startup failed cleanly with the fixed "bridge is not run
 Passwords backend with the same message; `~/.apwlib` was never created (nothing started a
 daemon). Without apwlib, `status` reported `apwlib: missing` and suggested `hermes pm repair`.
 
-## Required real-Mac checks (not yet executed)
+## Live acceptance on a real Mac (2026-10-18)
+
+macOS 27.0.1 (Mac mini, arm64), Google Chrome 155.0.8059.85, Python 3.14.7 (Hermes runtime),
+Hermes `d923a5eb48`, apwlib 0.1.2 / chauffeur 0.14.1, installed via `hermes plugins install`
+into the operator's default profile. Fixtures were synthetic logins (`hermes-applepw-test`,
+`hermes-applepw-sibling` on example.com) plus the published demo account of the public test site
+the-internet.herokuapp.com. Values were compared in code and never printed.
+
+| # | Check | Result |
+|---|---|---|
+| 1 | Install, dependency found | PASS (`apwlib: installed`) |
+| 2 | Pair; wrong PIN then retry | PASS (wrong PIN → "rejected the request"; retry paired) |
+| 3 | `list` metadata only + exact-host note; `read --reveal` exact value | PASS |
+| 4 | `run`: value delivered, child env = 7 base vars + mapping (plus macOS `__CF_USER_TEXT_ENCODING`), exit code 3 propagated, output suppressed / shown with `--show-output` | PASS |
+| 5 | `inject`: exact value, 0600, overwrite and symlink refused | PASS |
+| 6 | Real startup path: value applied with source label `apple_passwords`; overrides a shell value by default; kept shell value with `override_existing: false`; no value in output | PASS |
+| 7 | Bridge stop / recovery | pending (needs operator re-pair) |
+| 8 | Exact host: parent domain `herokuapp.com` and non-saved host refused | PASS |
+| 9 | OTP and true duplicate accounts | pending (operator, by hand) |
+| 10 | New Hermes session signed in to the-internet.herokuapp.com through `browser_vault` ("You logged into a secure area!"); fill on another origin → `origin_mismatch`; the password appears 0 times in the session's tool arguments, tool results, replies or reasoning | PASS |
+| 11 | New session loaded `apple-passwords:apple-passwords` | PASS |
+
+Findings from the live run:
+
+- Apple stores saved sites as **bare hosts** (`example.com`), not URLs.
+- Apple **strips a leading `www.`** on save (a save for `www.example.com` is stored as
+  `example.com`) and treats them as one account per username. The vault backend therefore allows
+  each saved host's `www.` form as a fill origin (nothing else is widened); references must use the
+  host `list` shows.
+- Saving through apwlib (used only to create fixtures; the plugin never saves) needs a macOS
+  approval. apwlib's helper times out after ~30 s, but the save lands once approved, and lookups for
+  that site fail until the prompt is answered.
+
+## Real-Mac checklist
 
 Use a disposable synthetic login in Apple Passwords, never production credentials:
 

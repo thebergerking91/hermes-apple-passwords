@@ -92,6 +92,8 @@ hint and Hermes carries on without those values.
 `applepw://HOST/URL-ENCODED-USERNAME/FIELD`, with FIELD `password`, `username`, or `otp`.
 Percent-encode the username (`me@example.com` → `me%40example.com`).
 
+Apple stores sites as bare hosts and strips a leading `www.` when saving, so a login saved on
+`www.github.com` is listed (and referenced) as `github.com`; browser sign-in fills it on both.
 Apple answers per registrable domain, so `list github.com` also shows logins saved for
 `gist.github.com` or `www.github.com`. The first column of `list` is the **exact saved host**
 — use that in the reference. Lookups match the exact saved host and username and fail on
