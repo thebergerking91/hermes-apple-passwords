@@ -5,7 +5,7 @@ bridge**. Nothing below has read a live password vault.
 
 ## Automated checks (2026-10-18)
 
-**314 tests passed, 0 skipped** with `python -m unittest discover -s tests` on macOS 27.0.1
+**324 tests passed, 0 skipped** with `python -m unittest discover -s tests` on macOS 27.0.1
 (arm64), Python 3.14.7 (Hermes's bundled runtime), against Hermes
 `d923a5eb487a17c0a68801bba9ef0f56c81040a8`. pytest was not installed in that environment
 and was not run.
@@ -77,10 +77,17 @@ Findings from the live run:
   each saved host's `www.` form as a fill origin (nothing else is widened); references must use the
   host `list` shows.
 - One-time-code entries report the same bare saved host (`domain: example.com`, `source: totp`).
-  The worker's parent-domain allowance for codes is therefore broader than needed: a
-  `www.example.com/…/otp` reference resolves while the matching `/password` reference is refused.
-- In both live pairing sessions the first PIN attempt after the bridge started was rejected and
-  the immediate retry succeeded (cause not yet determined).
+  v0.2.0 also accepted a parent-domain code entry, so a `www.example.com/…/otp` reference
+  resolved while the matching `/password` reference was refused. **Fixed in v0.2.1:** codes
+  require the exact saved host, like passwords.
+- **Cold-start pairing (fixed in v0.2.1).** After a fresh bridge start, the first PIN challenge
+  usually makes macOS show a PIN while the handshake never leaves `NotInSession` (measured: still
+  there after 40 s); a second challenge reaches `MSG1Set` in 0.1 s. apwlib waits only 10 s and
+  then lets the caller prompt, so v0.2.0's first PIN after a cold start was always rejected.
+  v0.2.1 polls the handshake state, replaces a dead challenge after a 3 s grace (up to 3
+  challenges), tells the user to ignore the first PIN, and offers up to 3 PIN attempts. Live: 4 of
+  4 cold-start trials hit the dead first challenge and recovered (ready after ~13.3 s); an
+  operator cold-start pairing with v0.2.1 succeeded on the first command.
 - Saving through apwlib (used only to create fixtures; the plugin never saves) needs a macOS
   approval. apwlib's helper times out after ~30 s, but the save lands once approved, and lookups for
   that site fail until the prompt is answered.

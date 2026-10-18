@@ -12,7 +12,7 @@ works:
 
 It does not create a replacement password vault.
 
-**Status: functional (v0.2.0), validated on one Mac.** The full real-Mac checklist passed on
+**Status: functional (v0.2.1), validated on one Mac.** The full real-Mac checklist passed on
 macOS 27.0.1 with Google Chrome 155 against Hermes `d923a5eb48`, including a real browser
 sign-in through `browser_vault`. Apple's bridge is unofficial, so other macOS/browser
 combinations and future Apple changes are unverified. See VALIDATION.md.
@@ -83,7 +83,9 @@ secret orchestrator, exactly like `secrets.onepassword`.
 
 Pairing is operator-only: type the PIN locally, never in agent chat. Pairing lasts for the
 bridge's lifetime; pair again after every reboot or logout and whenever the bridge's
-browser restarts (Apple issues a new PIN per pairing by design). Startup
+browser restarts (Apple issues a new PIN per pairing by design). Right after the bridge
+starts, the first PIN macOS shows usually doesn't work; `pair` notices, requests a new one, and
+tells you when to type — wait for its prompt and use the newest PIN. Startup
 never starts the bridge, prompts, or pairs — an unpaired bridge is reported with a remediation
 hint and Hermes carries on without those values.
 

@@ -1,7 +1,7 @@
 ---
 name: apple-passwords
 description: Use passwords and verification codes saved in Apple Passwords on macOS, the way the 1Password integration works — startup secret mappings, browser sign-in via browser_vault, and op-style read/run/inject without printing secrets.
-version: 0.2.0
+version: 0.2.1
 platforms: [macos]
 metadata:
   hermes:

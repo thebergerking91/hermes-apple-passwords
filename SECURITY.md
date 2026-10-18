@@ -16,8 +16,7 @@
   closed, bounded timeouts. Worker stderr and upstream exception text are never relayed;
   every error is a fixed sentence that cannot contain a value.
 - **Exact matching.** Lookups narrow by username and require the exact saved host. Sibling
-  hosts and duplicate accounts fail closed. One-time codes accept the entry's reported
-  domain when it is the reference host or its parent domain.
+  hosts and duplicate accounts fail closed. One-time codes follow the same exact-host rule.
 - **Metadata only from `list`** and the vault list. apwlib's per-site query still loads
   password fields into the worker's memory before they are discarded.
 - **No plaintext on disk** from the plugin: the startup cache is in-memory only. `inject`
