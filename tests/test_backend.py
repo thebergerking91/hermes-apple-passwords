@@ -1095,7 +1095,36 @@ class PairTests(unittest.TestCase):
         self.assertEqual(order, [("prompt", 1), "verify"])
         self.assertIn("macOS is ready for the PIN", err.getvalue())
 
-    def test_rechallenges_once_when_helper_never_gets_ready(self):
+    def test_cold_start_dead_first_challenge_is_replaced_promptly(self):
+        # Measured live: after a fresh bridge start the first challenge stays NotInSession
+        # forever; the second reaches MSG1Set at once. Expect: re-challenge, then prompt.
+        d = self._stateful_daemon([])
+        challenges = {"n": 0}
+        original = d.request_challenge
+
+        def request_challenge():
+            challenges["n"] += 1
+            original()
+
+        d.request_challenge = request_challenge
+        d._send_raw = lambda message: {"pairing_state": "MSG1Set" if challenges["n"] >= 2 else "NotInSession"}
+        prompts = []
+
+        def fake_getpass(*_a, **_k):
+            prompts.append(challenges["n"])
+            return "123456"
+
+        import time as time_module
+        with mock.patch.object(time_module, "sleep", lambda s: None), \
+                mock.patch.object(backend, "_HANDSHAKE_READY_TIMEOUT", 0.0), \
+                mock.patch.object(backend.getpass, "getpass", fake_getpass), \
+                mock.patch.object(backend.sys, "stderr", io.StringIO()) as err:
+            self.assertEqual(backend.pair(d), {"paired": True})
+        self.assertEqual(prompts, [2])  # prompted only after the working second challenge
+        self.assertIn("first PIN after the bridge starts doesn't work", err.getvalue())
+        self.assertIn("Wait for the prompt below", err.getvalue())
+
+    def test_rechallenges_when_helper_never_gets_ready(self):
         d = self._stateful_daemon(["ChallengeSent"] * 10_000)
         clock = {"t": 0.0}
 
@@ -1109,9 +1138,10 @@ class PairTests(unittest.TestCase):
                 mock.patch.object(backend.getpass, "getpass", lambda *a, **k: "123456"), \
                 mock.patch.object(backend.sys, "stderr", io.StringIO()) as err:
             self.assertEqual(backend.pair(d), {"paired": True})
-        self.assertEqual(d.calls.count("request_challenge"), 2)
-        self.assertIn("requesting a new PIN", err.getvalue())
-        self.assertIn("not ready", err.getvalue())
+        self.assertEqual(d.calls.count("request_challenge"), 3)
+        self.assertIn("Requesting a new PIN", err.getvalue())
+        self.assertIn("requesting another PIN", err.getvalue())
+        self.assertIn("did not get ready", err.getvalue())
 
     def test_unobservable_state_keeps_apwlib_behaviour(self):
         d = FakeDaemon()  # no _send_raw: older/other apwlib

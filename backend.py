@@ -432,7 +432,9 @@ def pair(daemon: object | None = None) -> dict[str, bool]:
 
 
 _PAIR_ATTEMPTS = 3
-_HANDSHAKE_READY_TIMEOUT = 45.0  # beyond apwlib's own 10 s wait; a cold helper can be slower
+_CHALLENGES = 3
+# apwlib's request_challenge already waits up to 10 s for MSG1Set; this is only extra grace.
+_HANDSHAKE_READY_TIMEOUT = 3.0
 _HANDSHAKE_POLL = 0.25
 
 
@@ -460,14 +462,15 @@ def _start_handshake(daemon: object) -> None:
     """Ask macOS for a PIN and return only once the handshake can accept it.
 
     apwlib waits at most 10 s for the ``MSG1Set`` state and then lets the caller continue;
-    a PIN submitted before ``MSG1Set`` wedges the handshake. On a freshly started bridge the
-    native helper can be slower than that, so keep waiting here, and re-request once if the
-    first challenge never got going."""
+    a PIN submitted before ``MSG1Set`` wedges the handshake. Measured live on a freshly
+    started bridge: the first challenge makes macOS show a PIN but the handshake never
+    leaves ``NotInSession`` (still there after 40 s), while an immediate second challenge
+    reaches ``MSG1Set`` in 0.1 s. So re-request promptly instead of waiting longer."""
     import time
 
     started = time.monotonic()
-    _say("Asking macOS for a pairing PIN...")
-    for challenge in (1, 2):
+    _say("Asking macOS for a pairing PIN. Wait for the prompt below before typing it.")
+    for challenge in range(1, _CHALLENGES + 1):
         daemon.request_challenge()
         deadline = time.monotonic() + _HANDSHAKE_READY_TIMEOUT
         state = _pairing_state(daemon)
@@ -480,8 +483,10 @@ def _start_handshake(daemon: object) -> None:
             _say(f"macOS is ready for the PIN (after {time.monotonic() - started:.1f} s).")
             return
         if challenge == 1:
-            _say("macOS did not get ready; requesting a new PIN. If you see more than one, type the newest.")
-    _say("macOS still is not ready; you can try the PIN anyway, or run pair again.")
+            _say("The first PIN after the bridge starts doesn't work; ignore it. Requesting a new PIN...")
+        elif challenge < _CHALLENGES:
+            _say("macOS is still not ready; requesting another PIN...")
+    _say("macOS did not get ready. Type the newest PIN anyway, or run pair again.")
 
 
 # --------------------------------------------------------------------------- dispatch
